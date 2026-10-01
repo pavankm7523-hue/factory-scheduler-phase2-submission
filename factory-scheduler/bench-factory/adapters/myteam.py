@@ -43,6 +43,18 @@ class Scheduler:
             trial1 = self.fast_construct(1)
             self.offer(trial1)
 
+        # Larger cases are much less forgiving of a single dispatch rule.
+        # Try distinct due-date/weight priorities before spending the remaining
+        # budget on local search.  Keep a safety reserve so construction never
+        # consumes the time needed to return the best valid candidate.
+        if self.n >= 700:
+            for rule in (1, 3, 6):
+                if perf_counter() >= self.deadline - 0.75:
+                    break
+                trial = self.active_construct(rule, 0.5)
+                if perf_counter() < self.deadline - 0.15:
+                    self.offer(trial)
+
         # 2. Fast gradient-guided critical path descent (<25 ms)
         # Deterministic step limits guarantee reproducible move selection across runs
         self.quick_descend(max_steps=min(25, max(8, 700 // self.n)))
