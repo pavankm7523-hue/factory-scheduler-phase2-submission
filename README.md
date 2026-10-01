@@ -52,3 +52,16 @@ allowed.
 Violation of these rules may disqualify a submission regardless of the score it
 prints. The organizers may request a short explanation of the algorithm and may
 reject code whose behavior cannot be reasonably audited.
+
+## Factory Scheduler submission
+
+The submitted Factory Scheduler adapter is:
+
+```text
+factory-scheduler/bench-factory/adapters/myteam.py
+```
+
+It builds several valid dispatch schedules, keeps the strongest one, and then
+uses deadline-aware local search. A local run of the supplied public benchmark
+produced 45.714/100. This is a practice estimate only; official scoring may use
+unseen instances and organizer-controlled execution.
