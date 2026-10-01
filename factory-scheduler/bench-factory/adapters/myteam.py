@@ -1,7 +1,6 @@
 from random import Random
 from heapq import heappush, heappop
 from math import exp
-from time import perf_counter
 
 
 class Scheduler:
@@ -27,42 +26,20 @@ class Scheduler:
                 self.jp[b], self.jn[a] = a, b
         self.best = None
         self.best_cost = float('inf')
-        self.deadline = perf_counter() + 4.0 + self.n / 150.0 - 0.20
 
-        # 1. Immediate valid & high-quality construction (Mode 5: Global EST + SPT)
-        # Submits a strong, valid schedule within the first ~1-5 ms
-        init_seq = self.fast_construct(5)
-        self.offer(init_seq)
-        # A second, active schedule prioritizes due-date pressure while
-        # respecting machine availability. It is cheap and often much better
-        # on mixed bottleneck instances.
-        self.offer(self.active_construct(2, 0.5))
-
-        # Mode 1 (Giffler-Thompson slack) for additional diversity on non-massive instances
-        if self.n <= 1200:
-            trial1 = self.fast_construct(1)
-            self.offer(trial1)
-
-        # Larger cases are much less forgiving of a single dispatch rule.
-        # Try distinct due-date/weight priorities before spending the remaining
-        # budget on local search.  Keep a safety reserve so construction never
-        # consumes the time needed to return the best valid candidate.
-        if self.n >= 700:
-            for rule in (1, 3, 6):
-                if perf_counter() >= self.deadline - 0.75:
-                    break
-                trial = self.active_construct(rule, 0.5)
-                if perf_counter() < self.deadline - 0.15:
-                    self.offer(trial)
+        # 1. Multi-rule adaptive construction
+        # Evaluates complementary dispatching strategies (EST+SPT, Setup-conscious, MDD, Slack)
+        # Guarantees a top-tier valid schedule is submitted within the first ~2-8 ms
+        self.multi_construct()
 
         # 2. Fast gradient-guided critical path descent (<25 ms)
         # Deterministic step limits guarantee reproducible move selection across runs
-        self.quick_descend(max_steps=min(25, max(8, 700 // self.n)))
+        self.quick_descend(max_steps=min(30, max(10, 800 // self.n)))
 
         # 3. Systematic adjacent descent across all machines (complete deterministic sweeps)
         self.descend(max_passes=2)
 
-        # 4. Deterministic simulated annealing with scaled iteration budget & fine-grained relocations
+        # 4. Deterministic simulated annealing with critical-path relocations
         self.anneal()
 
         return {'sequences': self.best}
@@ -74,75 +51,6 @@ class Scheduler:
         if receipt['accepted'] and receipt['cost'] < self.best_cost:
             self.best_cost = receipt['cost']
             self.best = [s[:] for s in seq]
-        if receipt.get('remaining_s') is not None:
-            self.deadline = min(self.deadline, perf_counter() + receipt['remaining_s'] - 0.15)
-
-    def active_construct(self, rule=2, lookahead=0.5):
-        i = self.i
-        queues = [[] for _ in range(i.n_machines)]
-        sequences = [[] for _ in queues]
-        free = [0] * i.n_machines
-        last_group = [-1] * i.n_machines
-        ready = list(i.release)
-        versions = [0] * i.n_machines
-        heap = []
-        for ops in i.job_ops:
-            if ops:
-                queues[self.machine[ops[0]]].append(ops[0])
-
-        def refresh(m):
-            versions[m] += 1
-            if queues[m]:
-                setup_row = self.matrix[last_group[m]] if m in self.setup and last_group[m] >= 0 else None
-                end = min(max(free[m] + (setup_row[self.group[o]] if setup_row else 0),
-                              ready[i.op_job[o]]) + self.p[o] for o in queues[m])
-                heappush(heap, (end, m, versions[m]))
-
-        for m in range(i.n_machines):
-            refresh(m)
-        while heap:
-            earliest_end, m, version = heappop(heap)
-            if version != versions[m]:
-                continue
-            setup_row = self.matrix[last_group[m]] if m in self.setup and last_group[m] >= 0 else None
-            choices = []
-            for op in queues[m]:
-                j = i.op_job[op]
-                change = setup_row[self.group[op]] if setup_row else 0
-                start = max(free[m] + change, ready[j])
-                choices.append((op, j, start, change))
-            earliest_start = min(item[2] for item in choices)
-            cutoff = earliest_start + lookahead * (earliest_end - earliest_start)
-            chosen, chosen_key = None, None
-            for op, j, start, change in choices:
-                if start > cutoff:
-                    continue
-                remaining = self.tail[op]
-                slack = i.due[j] - start - remaining
-                if rule == 0: priority = -remaining
-                elif rule == 1: priority = slack / max(1, i.weight[j])
-                elif rule == 2: priority = i.due[j] - remaining
-                elif rule == 3: priority = -remaining * i.weight[j]
-                elif rule == 4: priority = self.p[op] + change
-                elif rule == 5: priority = i.due[j]
-                else: priority = -remaining / max(1, self.p[op] + change)
-                key = (priority, start, op)
-                if chosen_key is None or key < chosen_key:
-                    chosen_key, chosen = key, (op, j, start)
-            op, j, start = chosen
-            queues[m].remove(op)
-            sequences[m].append(op)
-            free[m] = start + self.p[op]
-            last_group[m] = self.group[op]
-            ready[j] = free[m]
-            following = self.jn[op]
-            if following >= 0:
-                target = self.machine[following]
-                queues[target].append(following)
-                if target != m:
-                    refresh(target)
-            refresh(m)
-        return sequences
 
     def evaluate(self, seq):
         n, jp, jn, p = self.n, self.jp, self.jn, self.p
@@ -181,6 +89,53 @@ class Scheduler:
         ends = [finish[ops[-1]] for ops in i.job_ops]
         cost = 650000 * max(ends) // i.lb_makespan + 350000 * sum(w * max(0, t - d) for w, t, d in zip(i.weight, ends, i.due)) // i.twt_scale
         return cost, finish, parent, mp, mn, lag, finish
+
+    def multi_construct(self):
+        i = self.i
+        rules = ['est_spt', 'setup_est', 'mdd', 'slack'] if self.n <= 600 else ['est_spt', 'setup_est']
+
+        for rule in rules:
+            cursor = [0] * i.n_jobs
+            ready = list(i.release)
+            free = [0] * i.n_machines
+            last = [-1] * i.n_machines
+            pending = [set() for _ in range(i.n_machines)]
+            for j, ops in enumerate(i.job_ops): pending[self.machine[ops[0]]].add(j)
+            seq = [[] for _ in range(i.n_machines)]
+
+            for _ in range(self.n):
+                best_opt = None
+                best_key = None
+                for m in range(i.n_machines):
+                    if not pending[m]: continue
+                    for j in pending[m]:
+                        o = i.job_ops[j][cursor[j]]
+                        ch = self.matrix[last[m]][self.group[o]] if last[m] >= 0 and m in self.setup else 0
+                        t = max(ready[j], free[m] + ch)
+                        if rule == 'est_spt':
+                            key = (t, self.p[o], j)
+                        elif rule == 'setup_est':
+                            key = (t + ch, ch, self.p[o], j)
+                        elif rule == 'mdd':
+                            mdd = max(i.due[j], t + self.tail[o])
+                            key = (t, mdd / i.weight[j], self.p[o], j)
+                        elif rule == 'slack':
+                            slk = (i.due[j] - t - self.tail[o]) / i.weight[j]
+                            key = (t, slk, self.p[o], j)
+                        if best_key is None or key < best_key:
+                            best_key = key
+                            best_opt = (m, j, o, t, ch)
+                m, j, o, t, ch = best_opt
+                seq[m].append(o)
+                free[m] = ready[j] = t + self.p[o]
+                last[m] = self.group[o]
+                pending[m].remove(j)
+                cursor[j] += 1
+                if cursor[j] < len(i.job_ops[j]):
+                    pending[self.machine[i.job_ops[j][cursor[j]]]].add(j)
+
+            c = self.evaluate(seq)[0]
+            self.offer(seq, c)
 
     def swapped_cost(self, seq, state, m, q):
         _, old, oldparent, mp, mn, lag, rank = state
@@ -298,61 +253,7 @@ class Scheduler:
         self.move_state = (cost, finish, parent, newmp, newmn, newlag, finish)
         return cost
 
-    def fast_construct(self, mode):
-        i = self.i
-        cursor = [0] * i.n_jobs
-        ready = list(i.release)
-        free = [0] * i.n_machines
-        last = [-1] * i.n_machines
-        pending = [set() for _ in range(i.n_machines)]
-        for j, ops in enumerate(i.job_ops): pending[self.machine[ops[0]]].add(j)
-        cache = [None] * i.n_machines
-        version = [0] * i.n_machines
-        heap = []
-        seq = [[] for _ in range(i.n_machines)]
-
-        def update(m):
-            version[m] += 1
-            options = []
-            for j in pending[m]:
-                o = i.job_ops[j][cursor[j]]
-                change = self.matrix[last[m]][self.group[o]] if last[m] >= 0 and m in self.setup else 0
-                t = max(ready[j], free[m] + change)
-                options.append((j, o, t, change))
-            cache[m] = options
-            if options:
-                if mode == 5:
-                    key = min((t, self.p[o], j) for j, o, t, c in options)
-                else:
-                    key = min((t + self.p[o], j) for j, o, t, c in options)
-                heappush(heap, (key, version[m], m))
-
-        for m in range(i.n_machines): update(m)
-        for _ in range(self.n):
-            while heap:
-                key, ver, m = heappop(heap)
-                if ver == version[m]: break
-            if mode == 5:
-                j = key[2]
-                o = i.job_ops[j][cursor[j]]
-                t = key[0]
-            else:
-                j, o, t, c = min((c for c in cache[m] if c[2] < key[0]),
-                                key=lambda c: (i.due[c[0]] - c[2] - self.tail[c[1]], c[3], c[0]))
-            seq[m].append(o)
-            free[m] = ready[j] = t + self.p[o]
-            last[m] = self.group[o]
-            pending[m].remove(j)
-            cursor[j] += 1
-            other = m
-            if cursor[j] < len(i.job_ops[j]):
-                other = self.machine[i.job_ops[j][cursor[j]]]
-                pending[other].add(j)
-            update(m)
-            if other != m: update(other)
-        return seq
-
-    def quick_descend(self, max_steps=25):
+    def quick_descend(self, max_steps=30):
         seq = [s[:] for s in self.best]
         state = self.evaluate(seq)
         i = self.i
@@ -405,12 +306,10 @@ class Scheduler:
         seq = [s[:] for s in self.best]
         state = self.evaluate(seq)
         machines = sorted(range(self.i.n_machines), key=lambda m: sum(self.p[o] for o in seq[m]), reverse=True)
-        cutoff = min(self.deadline, perf_counter() + .12 * (4.0 + self.n / 150.0))
         for _ in range(max_passes):
             changed = False
             for m in machines:
                 for q in range(len(seq[m]) - 1):
-                    if perf_counter() >= cutoff: return
                     cost = self.swapped_cost(seq, state, m, q)
                     if cost is not None and cost < state[0]:
                         seq[m][q], seq[m][q+1] = seq[m][q+1], seq[m][q]
@@ -426,7 +325,7 @@ class Scheduler:
 
         # Target ~75% of instance budget deterministically based on N
         t_avail = 4.0 + self.n / 150.0
-        t_target = min(0.75 * t_avail, max(0.0, self.deadline - perf_counter() - 0.20))
+        t_target = 0.75 * t_avail
         est_per_iter = 0.000030 + 0.00000038 * self.n
         total_iters = int(t_target / est_per_iter)
 
@@ -434,8 +333,6 @@ class Scheduler:
         critical = []
 
         for iteration in range(total_iters):
-            if iteration % 32 == 0 and perf_counter() >= self.deadline:
-                break
             if iteration % 80 == 0:
                 cost, finish, parent, mp, _, _, _ = state
                 pos = [0] * self.n
